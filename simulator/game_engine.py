@@ -26,6 +26,7 @@ class GameState:
         self.game_over = False  # 游戏是否结束
         self.history: List[Dict] = []  # 历史记录
         self.team_scores = [0, 0]  # 队伍得分 [team0, team1]
+        self.round_just_reset = False  # 轮次刚刚重置标志位，供外部查询
 
 class GameEngine:
     """游戏引擎"""
@@ -155,12 +156,20 @@ class GameEngine:
         
         # 如果其余三人都 pass，新一轮开始
         if pass_count >= 3 and self.state.last_played_player is not None:
+            # 【修复】轮次得分结算：清空前计算本轮分值牌总分
+            round_score = sum(card.get_score_value() for card in self.state.current_round_cards)
+            if round_score > 0:
+                winner_idx = self.state.last_played_player
+                team_idx = 0 if winner_idx in [0, 2] else 1
+                self.state.team_scores[team_idx] += round_score
+
             # 清空当前轮次，最后出牌者重新主动出牌
             self.state.current_round_cards = []
             self.state.current_round_players = []
             self.state.last_played_hand = None  # 重置为主动出牌
             self.state.last_played_player = None
             self.state.round_count += 1
+            self.state.round_just_reset = True  # 通知外部轮次已重置
         
         # 记录历史
         self._log_event("pass", {
@@ -233,7 +242,16 @@ class GameEngine:
 
     def _calculate_final_scores(self):
         """计算最终得分"""
-        # 头游/末游奖励
+        # 【修复】剩余手牌中的分值牌计入对方队伍得分
+        for i, player in enumerate(self.players):
+            if len(player.hand) > 0:  # 未出完牌的玩家
+                remaining_score = sum(card.get_score_value() for card in player.hand)
+                if remaining_score > 0:
+                    my_team = 0 if i in [0, 2] else 1
+                    opponent_team = 1 - my_team
+                    self.state.team_scores[opponent_team] += remaining_score
+
+        # 头游/末游奖励（双向转移）
         if len(self.finished_order) >= 2:
             # 情况1: 同队前两名
             first = self.finished_order[0]
@@ -242,16 +260,18 @@ class GameEngine:
             second_team = 0 if second in [0, 2] else 1
 
             if first_team == second_team:
+                # 【修复】双向转移：己方+60，对方-60
                 self.state.team_scores[first_team] += Config.REWARD_1ST_2ND
-                # print(f"Team {first_team+1} gets 1st+2nd reward: +{Config.REWARD_1ST_2ND}")
+                self.state.team_scores[1 - first_team] -= Config.REWARD_1ST_2ND
             elif len(self.finished_order) >= 3:
                 # 情况2: 一游+三游同队
                 third = self.finished_order[2]
                 third_team = 0 if third in [0, 2] else 1
 
                 if first_team == third_team:
+                    # 【修复】双向转移：己方+30，对方-30
                     self.state.team_scores[first_team] += Config.REWARD_1ST_3RD
-                    # print(f"Team {first_team+1} gets 1st+3rd reward: +{Config.REWARD_1ST_3RD}")
+                    self.state.team_scores[1 - first_team] -= Config.REWARD_1ST_3RD
 
         # 记录最终结果
         self._log_event("game_over", {

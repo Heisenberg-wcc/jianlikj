@@ -65,6 +65,40 @@ class Config:
     CARD_BACK_COLOR = (50, 50, 150)
     CARD_FACE_COLOR = (255, 255, 255)
 
+    # ── 阶段一: TD Q-Learning 超参数 ──
+    TD_GAMMA           = 0.99       # 折扣系数 (0.98~0.995)
+    TD_LR              = 1e-4       # 学习率 (配合余弦退火)
+    TD_BATCH_SIZE      = 512        # 批大小
+    TD_BUFFER_MAX      = 200_000    # 经验缓冲区容量
+    TD_EPSILON_START   = 1.0        # 初始探索率
+    TD_EPSILON_MIN     = 0.05       # 最小探索率
+    TD_EPSILON_DECAY   = 0.997      # 每局衰减系数
+    TD_TARGET_SYNC     = 1000       # 目标网络同步频率 (每N次梯度更新)
+    TD_GRAD_CLIP       = 1.0        # 梯度裁剪阈值
+    TD_TRAIN_PER_EP    = 4          # 每局训练步数
+    TD_SAVE_INTERVAL   = 500        # 模型保存间隔 (每N局)
+    TD_SAVE_DIR        = "q_models" # 模型保存目录
+
+    # ── 阶段二: 策略梯度超参数 ──
+    PG_LR_ACTOR        = 3e-4       # Actor 学习率
+    PG_LR_CRITIC       = 1e-3       # Critic 学习率
+    PG_GAMMA           = 0.99       # 折扣系数
+    PG_ENTROPY_COEF    = 0.02       # 熵奖励系数 (初期较大保持探索)
+    PG_VALUE_COEF      = 0.5        # 价值损失权重
+    PG_GRAD_CLIP       = 1.0        # 梯度裁剪
+    PG_SAVE_DIR        = "pg_models"# 策略模型保存目录
+    PG_SAVE_INTERVAL   = 500        # 保存间隔
+
+    # ── 阶段三: 混合决策系统超参数 ──
+    HY_MODEL_POOL_SIZE = 20         # 历史模型池容量
+    HY_POOL_SAVE_FREQ  = 2000       # 入池频率 (每N局)
+    HY_LATEST_RATIO    = 0.7        # 对手采样: 最新模型占比
+    HY_ENTROPY_START   = 0.05       # 初始熵系数
+    HY_ENTROPY_END     = 0.005      # 最终熵系数
+    HY_ENTROPY_DECAY   = 50_000     # 熵衰减周期 (局数)
+    HY_SAVE_DIR        = "hybrid_models"  # 混合模型保存目录
+    HY_SAVE_INTERVAL   = 500        # 保存间隔
+
     # 日志级别
     LOG_LEVEL = "INFO"
     LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"

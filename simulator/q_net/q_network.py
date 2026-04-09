@@ -1,23 +1,21 @@
 """
-Q-Network: 基于状态-动作联合表示的 Q 值回归网络
+Q-Network: 增强版 Dueling DQN
 
-设计思路:
-  - 输入: state_vec (42维) + action_vec (16维) = 58维
-  - 输出: 单标量 Q 值 ∈ [-1, 1]，表示该动作在当前局面下的胜负期望
-  - 无 action mask，由规则引擎提前过滤合法动作集合
+设计升级:
+  - 状态向量: 42维 → 95维 (新增记牌器/得分/控牌者/出局等信息)
+  - 动作向量: 16维 → 24维 (新增牌型oneshot/张数/分值)
+  - 网络结构: Dueling DQN, V(s) + A(s,a)
+  - 容量扩大: 256-256-128-64
+  - 新增Dropout防止过拟合
 
-卡牌编码 (16维, 基于rank计数, 花色无关):
-  - ranks 3-15 (13种) → 每种的计数/最大可能数, 归一化到[0,1]
-  - 小王 (rank=16) → index 13
-  - 大王 (rank=17) → index 14
-  - 纯色510K标记 → index 15 (0或1)
+状态向量 (95维):
+  [ 我的手牌(16) | 上家出的牌(16) | 已出牌记录(16) | 本轮场上牌(16) |
+    位置(4) | 剩余牌数(4) | 队伍得分(2) | 本轮分值(1) |
+    控牌者(4) | 轮首标记(1) | 队伍(1) | 已出局(4) |
+    出局顺序(4) | 队伍排名优势(1) | PASS计数(4) | 游戏进程(1) ]
 
-状态向量 (42维):
-  [ 我的手牌计数(16) | 上家出的牌计数(16) | 我的位置one-hot(4) | 各玩家剩余牌数比(4) | 是否为轮首(1) | 我的队伍(1) ]
-
-动作向量 (16维):
-  出牌动作: 各rank计数归一化 + 纯色510K标记
-  不要(pass): 全零向量
+动作向量 (24维):
+  [ 牌编码(16) | 牌型oneshot(6) | 出牌张数(1) | 分值牌总分(1) ]
 """
 
 import os
@@ -30,9 +28,15 @@ from typing import List, Optional, Tuple
 # 维度常量
 # ────────────────────────────────────────────
 CARD_DIM     = 16       # 牌编码维度: 13 rank计数 + 2 王牌 + 1 纯色510K标记
-STATE_DIM    = 42       # 状态向量维度
-ACTION_DIM   = CARD_DIM # 动作向量维度
+STATE_DIM    = 95       # 状态向量维度 (增强版)
+ACTION_DIM   = 24       # 动作向量维度 (增强版)
 SUIT_ORDER   = ['spade', 'heart', 'club', 'diamond']
+
+# 牌型索引映射 (one-hot 6维)
+_HAND_TYPE_IDX = {
+    'single': 0, 'pair': 1, 'consecutive_pairs': 2,
+    'consecutive_threes': 3, 'bomb': 4, '510K': 5,
+}
 
 
 # ────────────────────────────────────────────
@@ -65,101 +69,227 @@ def _check_pure_510k(cards) -> bool:
 def encode_cards(cards) -> np.ndarray:
     """
     将牌列表编码为 16 维向量 (基于rank计数, 花色无关)
-
     结构: [rank3计数, rank4计数, ..., rank15计数, 小王计数, 大王计数, 纯色510K标记]
     归一化: ranks 3-15 除以8 (2副牌×4花色), 王牌除以2
-    cards: List[Card]
     """
     vec = np.zeros(CARD_DIM, dtype=np.float32)
     for c in cards:
         idx = rank_to_idx(c.rank)
         vec[idx] += 1.0
-
-    # 归一化: ranks 3-15 最多8张, 王牌最多2张
-    for i in range(13):   # ranks 3-15
+    for i in range(13):
         vec[i] /= 8.0
-    for i in range(13, 15):  # 小王, 大王
+    for i in range(13, 15):
         vec[i] /= 2.0
-
-    # 纯色510K标记
     vec[15] = 1.0 if _check_pure_510k(cards) else 0.0
-
     return vec
 
 
-def encode_state(game, player_idx: int, last_played_cards: list) -> np.ndarray:
+def encode_state(game, player_idx: int, last_played_cards: list,
+                 played_cards_history: list = None,
+                 current_round_cards: list = None,
+                 last_play_player: int = -1,
+                 pass_counts: list = None,
+                 step: int = 0) -> np.ndarray:
     """
-    编码当前状态 (42维), 从 player_idx 的视角
+    编码当前状态 (95维), 从 player_idx 的视角
 
-    Args:
-        game           : GameEngine 实例
-        player_idx     : 当前玩家索引 (0-3)
-        last_played_cards: 上家最新出的牌 (由 Trainer 追踪, 非 game.state.current_round_cards)
+    新增参数均有默认值, 兼容旧代码调用。
     """
-    player   = game.get_player(player_idx)
-    gs       = game.get_game_state()
+    player = game.get_player(player_idx)
+    gs     = game.get_game_state()
 
     # 1. 我的手牌 (16维)
     hand_vec = encode_cards(player.hand)
 
-    # 2. 上家出的牌 (16维) — 需要压过的目标
+    # 2. 上家出的牌 (16维)
     last_vec = encode_cards(last_played_cards)
 
-    # 3. 我的位置 one-hot (4维)
-    pos_vec  = np.zeros(4, dtype=np.float32)
+    # 3. 已出牌记录 / 记牌器 (16维)
+    if played_cards_history:
+        played_vec = encode_cards(played_cards_history)
+    else:
+        played_vec = np.zeros(CARD_DIM, dtype=np.float32)
+
+    # 4. 本轮场上牌 (16维)
+    if current_round_cards:
+        round_cards_vec = encode_cards(current_round_cards)
+    else:
+        round_cards_vec = encode_cards(gs.current_round_cards)
+
+    # 5. 我的位置 one-hot (4维)
+    pos_vec = np.zeros(4, dtype=np.float32)
     pos_vec[player_idx] = 1.0
 
-    # 4. 各玩家剩余牌数 (4维, 归一化)
+    # 6. 各玩家剩余牌数 (4维, 归一化)
     remain_vec = np.array(
         [len(game.get_player(i).hand) / 27.0 for i in range(4)],
         dtype=np.float32
     )
 
-    # 5. 是否为轮首(没有上家出牌) (1维)
+    # 7. 双方队伍得分 (2维, 除以200归一化)
+    scores_vec = np.array(
+        [gs.team_scores[0] / 200.0, gs.team_scores[1] / 200.0],
+        dtype=np.float32
+    )
+
+    # 8. 本轮场上分值 (1维)
+    round_score = sum(c.get_score_value() for c in gs.current_round_cards) / 50.0
+    round_score_vec = np.array([round_score], dtype=np.float32)
+
+    # 9. 控牌者 one-hot (4维)
+    ctrl_vec = np.zeros(4, dtype=np.float32)
+    if last_play_player >= 0:
+        ctrl_vec[last_play_player] = 1.0
+
+    # 10. 是否为轮首 (1维)
     is_round_start = np.array([1.0 if not last_played_cards else 0.0], dtype=np.float32)
 
-    # 6. 我的队伍 (1维: 0=Team1[0,2], 1=Team2[1,3])
+    # 11. 我的队伍 (1维)
     my_team = np.array([0.0 if player_idx in [0, 2] else 1.0], dtype=np.float32)
 
-    return np.concatenate([hand_vec, last_vec, pos_vec, remain_vec, is_round_start, my_team])
+    # 12. 已出局玩家 (4维)
+    out_vec = np.array(
+        [1.0 if game.get_player(i).is_out() else 0.0 for i in range(4)],
+        dtype=np.float32
+    )
+
+    # 13. 出局顺序 (4维)
+    order_vec = np.zeros(4, dtype=np.float32)
+    for i in range(4):
+        p = game.get_player(i)
+        if p.position is not None:
+            order_vec[i] = p.position / 4.0
+
+    # 14. 队伍排名优势 (1维)
+    my_team_idx = 0 if player_idx in [0, 2] else 1
+    my_team_players = [0, 2] if my_team_idx == 0 else [1, 3]
+    opp_team_players = [1, 3] if my_team_idx == 0 else [0, 2]
+    my_out = sum(1 for p in my_team_players if game.get_player(p).is_out())
+    opp_out = sum(1 for p in opp_team_players if game.get_player(p).is_out())
+    rank_adv = np.array([(my_out - opp_out) / 2.0], dtype=np.float32)
+
+    # 15. 各玩家连续PASS次数 (4维)
+    if pass_counts:
+        pass_vec = np.array([min(p, 5) / 5.0 for p in pass_counts], dtype=np.float32)
+    else:
+        pass_vec = np.zeros(4, dtype=np.float32)
+
+    # 16. 游戏进程 (1维)
+    progress = np.array([min(step, 300) / 300.0], dtype=np.float32)
+
+    return np.concatenate([
+        hand_vec,        # 16
+        last_vec,        # 16
+        played_vec,      # 16
+        round_cards_vec, # 16
+        pos_vec,         # 4
+        remain_vec,      # 4
+        scores_vec,      # 2
+        round_score_vec, # 1
+        ctrl_vec,        # 4
+        is_round_start,  # 1
+        my_team,         # 1
+        out_vec,         # 4
+        order_vec,       # 4
+        rank_adv,        # 1
+        pass_vec,        # 4
+        progress,        # 1
+    ])  # total = 95
 
 
 def encode_action(action: Optional[list]) -> np.ndarray:
     """
-    将出牌动作编码为 16 维向量
+    将出牌动作编码为 24 维向量
     action=None 表示 pass, 返回全零向量
+    结构: [rank编码(16) | 牌型oneshot(6) | 出牌张数(1) | 分值牌总分(1)]
     """
     if action is None:
-        return np.zeros(CARD_DIM, dtype=np.float32)
-    return encode_cards(action)
+        return np.zeros(ACTION_DIM, dtype=np.float32)
+
+    # 1. 牌编码 (16维)
+    card_vec = encode_cards(action)
+
+    # 2. 牌型 one-hot (6维)
+    from rules import RulesEngine
+    _rules = RulesEngine()
+    ht = _rules.detect_hand_type(action)
+    type_vec = np.zeros(6, dtype=np.float32)
+    idx = _HAND_TYPE_IDX.get(ht.value, -1)
+    if idx >= 0:
+        type_vec[idx] = 1.0
+
+    # 3. 出牌张数 (1维, /8归一化)
+    count_vec = np.array([len(action) / 8.0], dtype=np.float32)
+
+    # 4. 分值牌总分 (1维, /50归一化)
+    score_vec = np.array(
+        [sum(c.get_score_value() for c in action) / 50.0],
+        dtype=np.float32
+    )
+
+    return np.concatenate([card_vec, type_vec, count_vec, score_vec])
 
 
 # ────────────────────────────────────────────
-# Q 网络
+# Dueling Q 网络
 # ────────────────────────────────────────────
 class QNetwork(nn.Module):
     """
-    深度 Q 网络: (state, action) → Q value
+    Dueling DQN: (state, action) → Q value
 
     网络结构:
-      [state(42) | action(16)] → FC128 → ReLU → FC128 → ReLU → FC64 → ReLU → FC1 → Tanh
+      state → 状态嵌入(128)   → 拼接 → FC256 → FC256 → FC128
+      action → 动作嵌入(64)  ↑
+                                      ├→ V(s) 分支 → FC64 → 1
+                                      └→ A(s,a) 分支 → FC64 → 1
+      Q(s,a) = V(s) + A(s,a)
     """
 
     def __init__(self, state_dim: int = STATE_DIM, action_dim: int = ACTION_DIM):
         super().__init__()
-        in_dim = state_dim + action_dim
 
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, 128),
+        # 状态嵌入层
+        self.state_embed = nn.Sequential(
+            nn.Linear(state_dim, 128),
             nn.LayerNorm(128),
             nn.ReLU(),
-            nn.Linear(128, 128),
-            nn.LayerNorm(128),
+        )
+
+        # 动作嵌入层
+        self.action_embed = nn.Sequential(
+            nn.Linear(action_dim, 64),
+            nn.LayerNorm(64),
             nn.ReLU(),
+        )
+
+        # 共享主干
+        self.shared = nn.Sequential(
+            nn.Linear(128 + 64, 256),
+            nn.LayerNorm(256),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(256, 256),
+            nn.LayerNorm(256),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+        )
+
+        # V(s) 分支: 局面价值
+        self.value_head = nn.Sequential(
             nn.Linear(128, 64),
             nn.ReLU(),
             nn.Linear(64, 1),
-            nn.Tanh(),      # 输出 [-1, 1], +1=必赢, -1=必输
+            nn.Tanh(),
+        )
+
+        # A(s,a) 分支: 动作优势
+        self.advantage_head = nn.Sequential(
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1),
+            nn.Tanh(),
         )
 
     def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
@@ -170,8 +300,17 @@ class QNetwork(nn.Module):
         Returns:
             q      : (batch,) 或 scalar
         """
-        x = torch.cat([state, action], dim=-1)
-        return self.net(x).squeeze(-1)
+        s_emb = self.state_embed(state)
+        a_emb = self.action_embed(action)
+        x = torch.cat([s_emb, a_emb], dim=-1)
+        shared = self.shared(x)
+
+        v = self.value_head(shared).squeeze(-1)      # V(s)
+        a = self.advantage_head(shared).squeeze(-1)   # A(s,a)
+
+        # Q(s,a) = V(s) + A(s,a), 单个动作时不需要减去 mean(A)
+        q = v + a
+        return q.clamp(-2.0, 2.0)  # 限制范围
 
     @torch.no_grad()
     def predict(self, state_vec: np.ndarray, action_vec: np.ndarray) -> float:
@@ -204,6 +343,63 @@ class QNetwork(nn.Module):
 
         best_idx = int(np.argmax(qs))
         return actions[best_idx], float(qs[best_idx]), best_idx
+
+    @torch.no_grad()
+    def compute_max_q(
+        self,
+        state_vec: np.ndarray,
+        action_encs: List[np.ndarray],
+    ) -> float:
+        """
+        计算给定状态下所有合法动作的最大 Q 值 (用于 TD 目标计算)。
+
+        Args:
+            state_vec  : 状态向量 (STATE_DIM,)
+            action_encs: 合法动作编码列表
+        Returns:
+            最大 Q 值 (float)。若无合法动作返回 0.0。
+        """
+        if not action_encs:
+            return 0.0
+        self.eval()
+        n = len(action_encs)
+        s = torch.FloatTensor(state_vec).unsqueeze(0).expand(n, -1)
+        a = torch.FloatTensor(np.stack(action_encs))
+        qs = self.forward(s, a).cpu().numpy()
+        return float(np.max(qs))
+
+    @torch.no_grad()
+    def compute_q_for_action(
+        self,
+        state_vec: np.ndarray,
+        action_enc: np.ndarray,
+    ) -> float:
+        """
+        计算给定 (state, action) 对的 Q 值。
+        """
+        self.eval()
+        s = torch.FloatTensor(state_vec).unsqueeze(0)
+        a = torch.FloatTensor(action_enc).unsqueeze(0)
+        return self.forward(s, a).item()
+
+    @torch.no_grad()
+    def select_best_action_idx(
+        self,
+        state_vec: np.ndarray,
+        action_encs: List[np.ndarray],
+    ) -> int:
+        """
+        返回最优动作的索引 (用于 Double DQN 中 online 网络选动作)。
+        若无动作返回 -1。
+        """
+        if not action_encs:
+            return -1
+        self.eval()
+        n = len(action_encs)
+        s = torch.FloatTensor(state_vec).unsqueeze(0).expand(n, -1)
+        a = torch.FloatTensor(np.stack(action_encs))
+        qs = self.forward(s, a).cpu().numpy()
+        return int(np.argmax(qs))
 
     def save(self, path: str):
         os.makedirs(os.path.dirname(path) or '.', exist_ok=True)

@@ -1,6 +1,12 @@
 """
-对局回放脚本 - Q-MC 模型
-用法: python replay.py
+对局回放脚本 - 支持多种模型
+
+用法:
+  python replay.py              # 默认使用 TD DQN 模型
+  python replay.py --mode mc    # 使用旧版 Monte Carlo 模型
+  python replay.py --mode td    # 使用 TD DQN 模型
+  python replay.py --mode pg    # 使用策略梯度模型
+  python replay.py --mode hybrid# 使用混合决策模型
 """
 
 import sys
@@ -10,8 +16,105 @@ import argparse
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 
-def run_replay():
-    """Monte Carlo Q 网络对局回放"""
+def run_replay_td():
+    """TD DQN 模型对局回放"""
+    from train_td_dqn import TDDQNTrainer
+    from game_engine import GameEngine
+    from q_net.q_network import encode_state
+
+    print("=" * 70)
+    print("加载 TD DQN 模型...")
+    print("=" * 70)
+
+    trainer    = TDDQNTrainer()
+    model_path = "q_models/q_net_final.pth"
+    if os.path.exists(model_path):
+        trainer.load(model_path)
+    else:
+        print(f"[WARN] 模型不存在: {model_path}, 使用随机权重运行")
+
+    game = GameEngine()
+    game.initialize()
+
+    dealer_idx = next((i for i, p in enumerate(game.players) if p.is_dealer), 0)
+    print(f"\n庄家: Player{dealer_idx + 1}")
+    print("队伍: Team1 = [Player1, Player3], Team2 = [Player2, Player4]")
+    print("\n--- 初始手牌 ---")
+    for i, p in enumerate(game.players):
+        hand_str = ', '.join(str(c) for c in p.hand)
+        print(f"Player{i+1} ({'Team1' if i in [0,2] else 'Team2'}): {hand_str}")
+
+    print("\n" + "=" * 70)
+    print("游戏过程")
+    print("=" * 70)
+
+    step              = 0
+    max_steps         = 800
+    last_played_cards = []
+    last_play_player  = -1
+    passed_players    = set()
+
+    while not game.get_game_state().game_over and step < max_steps:
+        step += 1
+        current_idx = game.get_game_state().current_player_idx
+        player      = game.get_player(current_idx)
+        team        = "Team1" if current_idx in [0, 2] else "Team2"
+
+        if player.is_out():
+            game.pass_round(current_idx)
+            if last_play_player >= 0:
+                passed_players.add(current_idx)
+                last_played_cards, last_play_player, passed_players = \
+                    trainer._update_round_state(game, last_played_cards,
+                                                last_play_player, passed_players)
+            continue
+
+        action, action_enc, q_val = trainer.select_action(
+            game, current_idx, last_played_cards, explore=False
+        )
+
+        if action is not None:
+            cards_before = len(player.hand)
+            success      = game.play_card(current_idx, action)
+            if success:
+                remaining = cards_before - len(action)
+                try:
+                    cards_str = ', '.join(str(c) for c in action)
+                    print(f"Step {step:3d} | Player{current_idx+1} ({team}) "
+                          f"| 出牌: [{cards_str}] "
+                          f"| Q={q_val:+.3f} | 剩余: {remaining}张")
+                except UnicodeEncodeError:
+                    print(f"Step {step:3d} | Player{current_idx+1} ({team}) "
+                          f"| 出{len(action)}张牌 "
+                          f"| Q={q_val:+.3f} | 剩余: {remaining}张")
+                last_played_cards = list(action)
+                last_play_player  = current_idx
+                passed_players    = set()
+                if player.is_out():
+                    pos = len(game.finished_order)
+                    print(f"        >>> Player{current_idx+1} 出完牌！名次：第{pos}名 <<<")
+            else:
+                print(f"Step {step:3d} | Player{current_idx+1} ({team}) "
+                      f"| [INVALID, forced PASS] | 剩余: {len(player.hand)}张")
+                game.pass_round(current_idx)
+                if last_play_player >= 0:
+                    passed_players.add(current_idx)
+        else:
+            print(f"Step {step:3d} | Player{current_idx+1} ({team}) "
+                  f"| PASS | Q={q_val:+.3f} | 剩余: {len(player.hand)}张")
+            game.pass_round(current_idx)
+            if last_play_player >= 0:
+                passed_players.add(current_idx)
+
+        last_played_cards, last_play_player, passed_players = \
+            trainer._update_round_state(game, last_played_cards,
+                                        last_play_player, passed_players)
+
+    _print_game_result(game)
+
+
+def run_replay_mc():
+    """Monte Carlo Q 网络对局回放 (旧版兼容)"""
     from train_q_mc import MCQTrainer
     from game_engine import GameEngine
     from q_net.q_network import encode_state
@@ -54,7 +157,6 @@ def run_replay():
         player      = game.get_player(current_idx)
         team        = "Team1" if current_idx in [0, 2] else "Team2"
 
-        # 已出完牌的玩家自动 pass
         if player.is_out():
             game.pass_round(current_idx)
             if last_play_player >= 0:
@@ -64,7 +166,6 @@ def run_replay():
                                                 last_play_player, passed_players)
             continue
 
-        # 选择动作 (不探索)
         action, action_enc, q_val = trainer.select_action(
             game, current_idx, last_played_cards, explore=False
         )
@@ -102,12 +203,15 @@ def run_replay():
             if last_play_player >= 0:
                 passed_players.add(current_idx)
 
-        # 轮次重置检测
         last_played_cards, last_play_player, passed_players = \
             trainer._update_round_state(game, last_played_cards,
                                         last_play_player, passed_players)
 
-    # ── 结果 ──
+    _print_game_result(game)
+
+
+def _print_game_result(game):
+    """打印游戏结果"""
     print("\n" + "=" * 70)
     print("游戏结果")
     print("=" * 70)
@@ -128,5 +232,210 @@ def run_replay():
             print(f"  Player{i+1}: [{hand_str}]")
 
 
+def run_replay_pg():
+    """策略梯度模型对局回放"""
+    from train_policy import PolicyGradientTrainer
+    from game_engine import GameEngine
+
+    print("=" * 70)
+    print("加载策略梯度模型...")
+    print("=" * 70)
+
+    trainer = PolicyGradientTrainer()
+    policy_path = "pg_models/policy_final.pth"
+    value_path  = "pg_models/value_final.pth"
+    if os.path.exists(policy_path):
+        trainer.load(policy_path, value_path)
+    else:
+        print(f"[WARN] 模型不存在: {policy_path}, 使用随机权重运行")
+
+    game = GameEngine()
+    game.initialize()
+
+    dealer_idx = next((i for i, p in enumerate(game.players) if p.is_dealer), 0)
+    print(f"\n庄家: Player{dealer_idx + 1}")
+    print("队伍: Team1 = [Player1, Player3], Team2 = [Player2, Player4]")
+    print("\n--- 初始手牌 ---")
+    for i, p in enumerate(game.players):
+        hand_str = ', '.join(str(c) for c in p.hand)
+        print(f"Player{i+1} ({'Team1' if i in [0,2] else 'Team2'}): {hand_str}")
+
+    print("\n" + "=" * 70)
+    print("游戏过程")
+    print("=" * 70)
+
+    step = 0
+    max_steps = 800
+    last_played_cards = []
+    last_play_player  = -1
+    passed_players    = set()
+
+    while not game.get_game_state().game_over and step < max_steps:
+        step += 1
+        current_idx = game.get_game_state().current_player_idx
+        player      = game.get_player(current_idx)
+        team        = "Team1" if current_idx in [0, 2] else "Team2"
+
+        if player.is_out():
+            game.pass_round(current_idx)
+            if last_play_player >= 0:
+                passed_players.add(current_idx)
+                last_played_cards, last_play_player, passed_players = \
+                    trainer._update_round_state(game, last_played_cards,
+                                                last_play_player, passed_players)
+            continue
+
+        action, action_enc, score = trainer.select_action(
+            game, current_idx, last_played_cards, explore=False
+        )
+
+        if action is not None:
+            cards_before = len(player.hand)
+            success = game.play_card(current_idx, action)
+            if success:
+                remaining = cards_before - len(action)
+                try:
+                    cards_str = ', '.join(str(c) for c in action)
+                    print(f"Step {step:3d} | Player{current_idx+1} ({team}) "
+                          f"| 出牌: [{cards_str}] | 剩余: {remaining}张")
+                except UnicodeEncodeError:
+                    print(f"Step {step:3d} | Player{current_idx+1} ({team}) "
+                          f"| 出{len(action)}张牌 | 剩余: {remaining}张")
+                last_played_cards = list(action)
+                last_play_player  = current_idx
+                passed_players    = set()
+                if player.is_out():
+                    pos = len(game.finished_order)
+                    print(f"        >>> Player{current_idx+1} 出完牌！名次：第{pos}名 <<<")
+            else:
+                print(f"Step {step:3d} | Player{current_idx+1} ({team}) "
+                      f"| [INVALID, forced PASS] | 剩余: {len(player.hand)}张")
+                game.pass_round(current_idx)
+                if last_play_player >= 0:
+                    passed_players.add(current_idx)
+        else:
+            print(f"Step {step:3d} | Player{current_idx+1} ({team}) "
+                  f"| PASS | 剩余: {len(player.hand)}张")
+            game.pass_round(current_idx)
+            if last_play_player >= 0:
+                passed_players.add(current_idx)
+
+        last_played_cards, last_play_player, passed_players = \
+            trainer._update_round_state(game, last_played_cards,
+                                        last_play_player, passed_players)
+
+    _print_game_result(game)
+
+
+def run_replay_hybrid():
+    """混合决策模型对局回放"""
+    from train_hybrid import HybridTrainer
+    from game_engine import GameEngine
+
+    print("=" * 70)
+    print("加载混合决策模型...")
+    print("=" * 70)
+
+    trainer = HybridTrainer()
+    policy_path = "hybrid_models/policy_final.pth"
+    value_path  = "hybrid_models/value_final.pth"
+    if os.path.exists(policy_path):
+        trainer.load(policy_path, value_path)
+    else:
+        print(f"[WARN] 模型不存在: {policy_path}, 使用随机权重运行")
+
+    game = GameEngine()
+    game.initialize()
+
+    dealer_idx = next((i for i, p in enumerate(game.players) if p.is_dealer), 0)
+    print(f"\n庄家: Player{dealer_idx + 1}")
+    print("队伍: Team1 = [Player1, Player3], Team2 = [Player2, Player4]")
+    print("\n--- 初始手牌 ---")
+    for i, p in enumerate(game.players):
+        hand_str = ', '.join(str(c) for c in p.hand)
+        print(f"Player{i+1} ({'Team1' if i in [0,2] else 'Team2'}): {hand_str}")
+
+    print("\n" + "=" * 70)
+    print("游戏过程")
+    print("=" * 70)
+
+    step = 0
+    max_steps = 800
+    last_played_cards = []
+    last_play_player  = -1
+    passed_players    = set()
+
+    while not game.get_game_state().game_over and step < max_steps:
+        step += 1
+        current_idx = game.get_game_state().current_player_idx
+        player      = game.get_player(current_idx)
+        team        = "Team1" if current_idx in [0, 2] else "Team2"
+
+        if player.is_out():
+            game.pass_round(current_idx)
+            if last_play_player >= 0:
+                passed_players.add(current_idx)
+                last_played_cards, last_play_player, passed_players = \
+                    trainer._update_round_state(game, last_played_cards,
+                                                last_play_player, passed_players)
+            continue
+
+        action, action_enc, score = trainer.select_action(
+            game, current_idx, last_played_cards, explore=False
+        )
+
+        if action is not None:
+            cards_before = len(player.hand)
+            success = game.play_card(current_idx, action)
+            if success:
+                remaining = cards_before - len(action)
+                try:
+                    cards_str = ', '.join(str(c) for c in action)
+                    print(f"Step {step:3d} | Player{current_idx+1} ({team}) "
+                          f"| 出牌: [{cards_str}] | 剩余: {remaining}张")
+                except UnicodeEncodeError:
+                    print(f"Step {step:3d} | Player{current_idx+1} ({team}) "
+                          f"| 出{len(action)}张牌 | 剩余: {remaining}张")
+                last_played_cards = list(action)
+                last_play_player  = current_idx
+                passed_players    = set()
+                if player.is_out():
+                    pos = len(game.finished_order)
+                    print(f"        >>> Player{current_idx+1} 出完牌！名次：第{pos}名 <<<")
+            else:
+                print(f"Step {step:3d} | Player{current_idx+1} ({team}) "
+                      f"| [INVALID, forced PASS] | 剩余: {len(player.hand)}张")
+                game.pass_round(current_idx)
+                if last_play_player >= 0:
+                    passed_players.add(current_idx)
+        else:
+            print(f"Step {step:3d} | Player{current_idx+1} ({team}) "
+                  f"| PASS | 剩余: {len(player.hand)}张")
+            game.pass_round(current_idx)
+            if last_play_player >= 0:
+                passed_players.add(current_idx)
+
+        last_played_cards, last_play_player, passed_players = \
+            trainer._update_round_state(game, last_played_cards,
+                                        last_play_player, passed_players)
+
+    _print_game_result(game)
+
+
 if __name__ == "__main__":
-    run_replay()
+    parser = argparse.ArgumentParser(description='对局回放')
+    parser.add_argument('--mode', type=str, default='td',
+                        choices=['mc', 'td', 'pg', 'hybrid'],
+                        help='选择回放模型类型: mc=Monte Carlo, td=TD DQN, pg=策略梯度, hybrid=混合')
+    args = parser.parse_args()
+
+    if args.mode == 'mc':
+        run_replay_mc()
+    elif args.mode == 'td':
+        run_replay_td()
+    elif args.mode == 'pg':
+        run_replay_pg()
+    elif args.mode == 'hybrid':
+        run_replay_hybrid()
+    else:
+        run_replay_td()
