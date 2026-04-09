@@ -157,6 +157,18 @@ class HybridTrainer:
         ht = self.rules.detect_hand_type(last_played_cards)
         return Hand(last_played_cards, ht) if ht != HandType.INVALID else None
 
+    def _encode_state_full(self, game: GameEngine, player_idx: int, last_played_cards: list) -> np.ndarray:
+        """编码完整状态，包含所有追踪信息"""
+        gs = game.get_game_state()
+        return encode_state(
+            game, player_idx, last_played_cards,
+            played_cards_history=game.get_played_cards_history(),
+            current_round_cards=gs.current_round_cards,
+            last_play_player=gs.last_played_player if gs.last_played_player is not None else -1,
+            pass_counts=game.get_pass_counts(),
+            step=game.get_total_step()
+        )
+
     def _get_legal_encs(self, game, player_idx, last_played_cards):
         player    = game.get_player(player_idx)
         last_hand = self._get_last_hand(last_played_cards)
@@ -200,7 +212,7 @@ class HybridTrainer:
         last_hand = self._get_last_hand(last_played_cards)
 
         def policy_select_fn(actions, action_encs):
-            state_vec = encode_state(game, player_idx, last_played_cards)
+            state_vec = self._encode_state_full(game, player_idx, last_played_cards)
             net.eval()
             chosen_idx, log_prob = net.select_action(
                 state_vec, action_encs, deterministic=deterministic
@@ -221,7 +233,7 @@ class HybridTrainer:
             return action, action_enc, 0.0, source
 
         # 重新计算 log_prob (用于策略梯度)
-        state_vec = encode_state(game, player_idx, last_played_cards)
+        state_vec = self._encode_state_full(game, player_idx, last_played_cards)
         actions, action_encs = self._get_legal_encs(game, player_idx, last_played_cards)
         net.eval()
         chosen_idx, log_prob = net.select_action(
@@ -288,7 +300,7 @@ class HybridTrainer:
             net = self.policy_net if current_idx in [0, 2] else self.opponent_net
 
             # 编码状态
-            state_vec = encode_state(game, current_idx, last_played_cards)
+            state_vec = self._encode_state_full(game, current_idx, last_played_cards)
 
             # 获取合法动作
             actions, action_encs = self._get_legal_encs(
@@ -569,8 +581,10 @@ class HybridTrainer:
     ) -> Tuple[Optional[list], np.ndarray, float]:
         """兼容 replay.py 接口"""
         last_hand = self._get_last_hand(last_played_cards)
+        # 更新game_state中的last_play_player以确保_encode_state_full正确工作
+        gs = game.get_game_state()
         action, action_enc, log_prob, source = self._select_action_for_player(
-            game, player_idx, last_played_cards, -1,
+            game, player_idx, last_played_cards, gs.last_played_player if gs.last_played_player is not None else -1,
             self.policy_net, deterministic=not explore,
         )
         return action, action_enc, log_prob

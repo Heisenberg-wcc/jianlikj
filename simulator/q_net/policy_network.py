@@ -1,7 +1,11 @@
 """
-策略网络 (PolicyNetwork) 和价值网络 (ValueNetwork)
+策略网络 (PolicyNetwork) 和价值网络 (ValueNetwork) - 修复版
 
 阶段二: 策略梯度学习 (Actor-Critic)
+
+修复内容:
+  - 扩大网络容量: 状态嵌入256, 动作嵌入128, 主干512
+  - 移除V(s)的Tanh限制，让价值网络自由学习
 
 策略网络 (Actor):
   - 输入: state (95维) + 合法动作集合 (变长, 每个 24维)
@@ -10,7 +14,7 @@
 
 价值网络 (Critic / Baseline):
   - 输入: state (95维)
-  - 输出: V(s) 局面价值标量
+  - 输出: V(s) 局面价值标量 (无值域限制)
   - 作用: 降低策略梯度方差
 """
 
@@ -161,18 +165,18 @@ class ValueNetwork(nn.Module):
         super().__init__()
 
         self.network = nn.Sequential(
-            nn.Linear(state_dim, 256),
-            nn.LayerNorm(256),
+            nn.Linear(state_dim, 512),
+            nn.LayerNorm(512),
             nn.ReLU(),
             nn.Dropout(0.1),
-            nn.Linear(256, 256),
-            nn.LayerNorm(256),
+            nn.Linear(512, 512),
+            nn.LayerNorm(512),
             nn.ReLU(),
             nn.Dropout(0.1),
-            nn.Linear(256, 128),
+            nn.Linear(512, 256),
             nn.ReLU(),
-            nn.Linear(128, 1),
-            nn.Tanh(),
+            nn.Linear(256, 1),
+            # 移除Tanh，让V(s)自由学习价值范围
         )
 
     def forward(self, state: torch.Tensor) -> torch.Tensor:

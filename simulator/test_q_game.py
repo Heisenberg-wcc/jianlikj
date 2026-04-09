@@ -13,11 +13,25 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import torch
 from game_engine import GameEngine
 from action_space import ActionSpace
 from rules import RulesEngine, Hand, HandType
 from train_q_mc import MCQTrainer
+from train_td_dqn import TDDQNTrainer
 from q_net.q_network import encode_state, encode_action
+
+
+def load_trainer(path: str):
+    """自动识别模型格式，返回对应 trainer（已加载权重）"""
+    ckpt = torch.load(path, map_location='cpu', weights_only=False)
+    keys = set(ckpt.keys()) if isinstance(ckpt, dict) else set()
+    if 'team0' in keys or 'team1' in keys:
+        t = TDDQNTrainer()
+    else:
+        t = MCQTrainer()
+    t.load(path)
+    return t
 
 
 def _get_last_hand(rules, last_played_cards):
@@ -137,11 +151,11 @@ def evaluate(model_path, num_games=500):
     print(f"每项评估局数: {num_games} 局")
     print("=" * 60)
 
-    trainer = MCQTrainer()
     if os.path.exists(model_path):
-        trainer.load(model_path)
+        trainer = load_trainer(model_path)
         print(f"[OK] 模型加载成功\n")
     else:
+        trainer = MCQTrainer()
         print(f"[WARN] 未找到模型文件: {model_path}, 使用随机初始化网络\n")
 
     # ── 1. 模型自博弈 (ε=0) ──
@@ -215,11 +229,14 @@ def compare_models(path_a, path_b, num_games=300):
     results = {}
     for label, path in [(os.path.basename(path_a), path_a),
                         (os.path.basename(path_b), path_b)]:
-        trainer = MCQTrainer()
-        if os.path.exists(path):
-            trainer.load(path)
-        else:
+        if not os.path.exists(path):
             print(f"[WARN] 文件不存在: {path}")
+            results[label] = None
+            continue
+        try:
+            trainer = load_trainer(path)
+        except Exception as e:
+            print(f"[WARN] 加载失败: {path}  ({e})")
             results[label] = None
             continue
 
@@ -253,6 +270,6 @@ def compare_models(path_a, path_b, num_games=300):
 
 
 if __name__ == "__main__":
-    path_a = os.path.join("q_models", "model1.0.pth")
+    path_a = r"C:\Users\Administrator\Desktop\project\jianlikj\q_models\model2.0.pth"
     path_b = os.path.join("q_models", "base.pth")
     compare_models(path_a, path_b, num_games=300)

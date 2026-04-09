@@ -237,59 +237,56 @@ class QNetwork(nn.Module):
     """
     Dueling DQN: (state, action) → Q value
 
-    网络结构:
-      state → 状态嵌入(128)   → 拼接 → FC256 → FC256 → FC128
-      action → 动作嵌入(64)  ↑
-                                      ├→ V(s) 分支 → FC64 → 1
-                                      └→ A(s,a) 分支 → FC64 → 1
-      Q(s,a) = V(s) + A(s,a)
+    网络结构 (修复版 - 扩大容量，移除值域限制):
+      state → 状态嵌入(256)   → 拼接 → FC512 → FC512 → FC256
+      action → 动作嵌入(128)  ↑
+                                      ├→ V(s) 分支 → FC128 → 1 (无Tanh)
+                                      └→ A(s,a) 分支 → FC128 → 1 (无Tanh)
+      Q(s,a) = V(s) + A(s,a) (无clamp)
     """
 
-    def __init__(self, state_dim: int = STATE_DIM, action_dim: int = ACTION_DIM):
+    def __init__(self, state_dim: int = STATE_DIM, action_dim: int = ACTION_DIM,
+                 state_hidden: int = 256, action_hidden: int = 128):
         super().__init__()
+        sh = state_hidden
+        ah = action_hidden
+        shared_in  = sh + ah
+        shared_mid = sh * 2        # 256 for sh=128, 512 for sh=256
+        shared_out = sh             # 128 for sh=128, 256 for sh=256
+        head_in    = shared_out
+        head_hid   = sh // 2       # 64  for sh=128, 128 for sh=256
 
-        # 状态嵌入层
         self.state_embed = nn.Sequential(
-            nn.Linear(state_dim, 128),
-            nn.LayerNorm(128),
+            nn.Linear(state_dim, sh),
+            nn.LayerNorm(sh),
             nn.ReLU(),
         )
-
-        # 动作嵌入层
         self.action_embed = nn.Sequential(
-            nn.Linear(action_dim, 64),
-            nn.LayerNorm(64),
+            nn.Linear(action_dim, ah),
+            nn.LayerNorm(ah),
             nn.ReLU(),
         )
-
-        # 共享主干
         self.shared = nn.Sequential(
-            nn.Linear(128 + 64, 256),
-            nn.LayerNorm(256),
+            nn.Linear(shared_in, shared_mid),
+            nn.LayerNorm(shared_mid),
             nn.ReLU(),
             nn.Dropout(0.1),
-            nn.Linear(256, 256),
-            nn.LayerNorm(256),
+            nn.Linear(shared_mid, shared_mid),
+            nn.LayerNorm(shared_mid),
             nn.ReLU(),
             nn.Dropout(0.1),
-            nn.Linear(256, 128),
+            nn.Linear(shared_mid, shared_out),
             nn.ReLU(),
         )
-
-        # V(s) 分支: 局面价值
         self.value_head = nn.Sequential(
-            nn.Linear(128, 64),
+            nn.Linear(head_in, head_hid),
             nn.ReLU(),
-            nn.Linear(64, 1),
-            nn.Tanh(),
+            nn.Linear(head_hid, 1),
         )
-
-        # A(s,a) 分支: 动作优势
         self.advantage_head = nn.Sequential(
-            nn.Linear(128, 64),
+            nn.Linear(head_in, head_hid),
             nn.ReLU(),
-            nn.Linear(64, 1),
-            nn.Tanh(),
+            nn.Linear(head_hid, 1),
         )
 
     def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
@@ -310,7 +307,7 @@ class QNetwork(nn.Module):
 
         # Q(s,a) = V(s) + A(s,a), 单个动作时不需要减去 mean(A)
         q = v + a
-        return q.clamp(-2.0, 2.0)  # 限制范围
+        return q  # 移除clamp，让网络自由学习Q值范围
 
     @torch.no_grad()
     def predict(self, state_vec: np.ndarray, action_vec: np.ndarray) -> float:
@@ -407,4 +404,10 @@ class QNetwork(nn.Module):
 
     def load(self, path: str):
         ckpt = torch.load(path, map_location='cpu', weights_only=False)
-        self.load_state_dict(ckpt['q_net'])
+        sd = ckpt['q_net']
+        # 自动检测网络尺寸，如果与当前不符则重建对应大小
+        sh = sd['state_embed.0.weight'].shape[0]   # 128 or 256
+        ah = sd['action_embed.0.weight'].shape[0]  # 64  or 128
+        if sh != self.state_embed[0].out_features or ah != self.action_embed[0].out_features:
+            self.__init__(state_hidden=sh, action_hidden=ah)
+        self.load_state_dict(sd)

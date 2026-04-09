@@ -95,6 +95,18 @@ class PolicyGradientTrainer:
         ht = self.rules.detect_hand_type(last_played_cards)
         return Hand(last_played_cards, ht) if ht != HandType.INVALID else None
 
+    def _encode_state_full(self, game: GameEngine, player_idx: int, last_played_cards: list) -> np.ndarray:
+        """编码完整状态，包含所有追踪信息"""
+        gs = game.get_game_state()
+        return encode_state(
+            game, player_idx, last_played_cards,
+            played_cards_history=game.get_played_cards_history(),
+            current_round_cards=gs.current_round_cards,
+            last_play_player=gs.last_played_player if gs.last_played_player is not None else -1,
+            pass_counts=game.get_pass_counts(),
+            step=game.get_total_step()
+        )
+
     def _get_legal_encs(
         self, game: GameEngine, player_idx: int, last_played_cards: list
     ) -> Tuple[List[Optional[list]], List[np.ndarray]]:
@@ -217,7 +229,7 @@ class PolicyGradientTrainer:
                 continue
 
             # 编码状态
-            state_vec = encode_state(game, current_idx, last_played_cards)
+            state_vec = self._encode_state_full(game, current_idx, last_played_cards)
 
             # 获取合法动作
             actions, action_encs = self._get_legal_encs(
@@ -465,7 +477,7 @@ class PolicyGradientTrainer:
         )
         deterministic = not explore
         chosen_idx, log_prob = self.policy_net.select_action(
-            encode_state(game, player_idx, last_played_cards),
+            self._encode_state_full(game, player_idx, last_played_cards),
             action_encs,
             deterministic=deterministic,
         )

@@ -97,6 +97,18 @@ class MCQTrainer:
         ht = self.rules.detect_hand_type(last_played_cards)
         return Hand(last_played_cards, ht) if ht != HandType.INVALID else None
 
+    def _encode_state_full(self, game: GameEngine, player_idx: int, last_played_cards: list) -> np.ndarray:
+        """编码完整状态，包含所有追踪信息"""
+        gs = game.get_game_state()
+        return encode_state(
+            game, player_idx, last_played_cards,
+            played_cards_history=game.get_played_cards_history(),
+            current_round_cards=gs.current_round_cards,
+            last_play_player=gs.last_played_player if gs.last_played_player is not None else -1,
+            pass_counts=game.get_pass_counts(),
+            step=game.get_total_step()
+        )
+
     def select_action(
         self,
         game: GameEngine,
@@ -136,7 +148,7 @@ class MCQTrainer:
             return chosen[0], chosen[1], 0.0
 
         # ── Exploit: 批量计算 Q, 选最大 ──
-        state_vec = encode_state(game, player_idx, last_played_cards)
+        state_vec = self._encode_state_full(game, player_idx, last_played_cards)
         actions   = [c[0] for c in candidates]
         encs      = [c[1] for c in candidates]
         best_a, best_q, _ = self.q_net.select_best(state_vec, actions, encs)
@@ -212,7 +224,7 @@ class MCQTrainer:
                 continue
 
             # 编码当前状态
-            state_vec = encode_state(game, current_idx, last_played_cards)
+            state_vec = self._encode_state_full(game, current_idx, last_played_cards)
 
             # 选择动作
             action, action_enc, q_val = self.select_action(

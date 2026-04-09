@@ -27,6 +27,11 @@ class GameState:
         self.history: List[Dict] = []  # 历史记录
         self.team_scores = [0, 0]  # 队伍得分 [team0, team1]
         self.round_just_reset = False  # 轮次刚刚重置标志位，供外部查询
+        
+        # 【新增】记牌器和游戏进程追踪
+        self.played_cards_history: List[Card] = []  # 本局已出的所有牌（记牌器）
+        self.pass_counts: List[int] = [0, 0, 0, 0]  # 各玩家连续PASS次数
+        self.total_step = 0  # 游戏总步数（用于encode_state的step参数）
 
 class GameEngine:
     """游戏引擎"""
@@ -112,6 +117,11 @@ class GameEngine:
         player.remove_cards(cards)
         self.state.current_round_cards.extend(cards)
         self.state.current_round_players.append(player_idx)
+        
+        # 【新增】更新记牌器和步数
+        self.state.played_cards_history.extend(cards)
+        self.state.pass_counts[player_idx] = 0  # 出牌则重置PASS计数
+        self.state.total_step += 1
 
         # 记录历史
         self._log_event("play_card", {
@@ -143,6 +153,10 @@ class GameEngine:
             player_idx: 玩家ID
         """
         self.state.current_round_players.append(player_idx)
+        
+        # 【新增】增加PASS计数和总步数
+        self.state.pass_counts[player_idx] += 1
+        self.state.total_step += 1
         
         # 检查是否其他三人都 pass 了 (当前出牌者之后3人都pass)
         # 统计从上一次出牌后连续 pass 的人数
@@ -306,6 +320,18 @@ class GameEngine:
             player.reset()
         self.state = GameState()
         self.finished_order = []
+        
+    def get_played_cards_history(self) -> List[Card]:
+        """获取已出牌历史（记牌器）"""
+        return self.state.played_cards_history
+    
+    def get_pass_counts(self) -> List[int]:
+        """获取各玩家连续PASS次数"""
+        return self.state.pass_counts
+    
+    def get_total_step(self) -> int:
+        """获取游戏总步数"""
+        return self.state.total_step
 
 # 测试代码
 if __name__ == "__main__":

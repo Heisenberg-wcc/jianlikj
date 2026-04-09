@@ -1,25 +1,44 @@
 """
-TD Q-Learning + Target Network + Double DQN 自博弈训练器
+TD Q-Learning + Target Network + Double DQN 自博弈训练器 (队伍网络版)
 
-核心升级 (相对于 Monte Carlo 版本):
-  1. 数据结构: (state, action, reward, next_state, next_legal_action_encs, done)
-  2. 训练目标: TD target = r + gamma * Q_target(s', a_best)  (Double DQN)
-  3. 目标网络: 每 TARGET_SYNC 步硬同步一次, 提供稳定的目标值
-  4. 即时奖励: 每一步动作执行后立即计算, 不再等整局结束回填
+核心升级:
+  1. 按队伍拆分网络: Team 0 (玩家0,2) 和 Team 1 (玩家1,3) 各自拥有独立的Q网络
+  2. 解决对抗游戏中目标函数冲突的问题
+  3. 数据结构: (state, action, reward, next_state, next_legal_action_encs, done, player_idx)
+  4. 训练目标: TD target = r + gamma * Q_target(s', a_best)  (Double DQN)
+  5. 目标网络: 每 TARGET_SYNC 步硬同步一次, 提供稳定的目标值
+  6. 即时奖励: 每一步动作执行后立即计算, 不再等整局结束回填
 
-训练循环: 执行动作 → 计算即时奖励 → 编码 next_state → 存入缓冲区 → 采样训练
+训练循环: 执行动作 → 计算即时奖励 → 编码 next_state → 存入缓冲区 → 按队伍采样训练
 """
 
 import os
 import sys
 import copy
 import random
+import time
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from collections import deque, namedtuple
 from typing import List, Optional, Dict, Tuple
+
+# ── 进度条工具 ──
+def print_progress_bar(episode, total, win_rate, loss, epsilon, steps, buffer_size, start_time):
+    """打印实时进度条"""
+    percent = episode / total
+    bar_len = 30
+    filled = int(bar_len * percent)
+    bar = '█' * filled + '░' * (bar_len - filled)
+    elapsed = time.time() - start_time
+    eps_per_sec = episode / elapsed if elapsed > 0 else 0
+    eta = (total - episode) / eps_per_sec if eps_per_sec > 0 else 0
+    
+    print(f'\r[{bar}] {episode}/{total} ({percent:.1%}) | '
+          f'Win:{win_rate:.1%} Loss:{loss:.4f} ε:{epsilon:.3f} | '
+          f'Steps:{steps:.0f} Buf:{buffer_size} | '
+          f'Speed:{eps_per_sec:.1f}eps/s ETA:{eta/60:.1f}min', end='', flush=True)
 
 # ── 路径设置 ──
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -29,10 +48,8 @@ from action_space import ActionSpace
 from rules import RulesEngine, Hand, HandType
 from card import Card
 from config import Config
-from q_net.q_network import (
-    QNetwork, encode_state, encode_action,
-    STATE_DIM, ACTION_DIM
-)
+from q_net.q_network import encode_state, encode_action, STATE_DIM, ACTION_DIM
+from q_net.team_networks import TeamQNetwork, get_player_team
 
 # ────────────────────────────────────────────
 # TD 经验样本 & 回放缓冲区
@@ -44,6 +61,7 @@ TDSample = namedtuple('TDSample', [
     'next_state',           # np.ndarray (STATE_DIM,)
     'next_action_encs',     # List[np.ndarray]  下一状态合法动作编码
     'done',                 # bool  是否结束
+    'player_idx',           # int  执行动作的玩家 (用于选择对应队伍的网络)
 ])
 
 
@@ -53,7 +71,7 @@ class TDReplayBuffer:
     def __init__(self, max_size: int = 200_000):
         self.buffer = deque(maxlen=max_size)
 
-    def push(self, state, action_enc, reward, next_state, next_action_encs, done):
+    def push(self, state, action_enc, reward, next_state, next_action_encs, done, player_idx):
         self.buffer.append(TDSample(
             state=state.astype(np.float32),
             action=action_enc.astype(np.float32),
@@ -61,6 +79,7 @@ class TDReplayBuffer:
             next_state=next_state.astype(np.float32),
             next_action_encs=[ae.astype(np.float32) for ae in next_action_encs],
             done=bool(done),
+            player_idx=player_idx,
         ))
 
     def sample(self, batch_size: int):
@@ -91,12 +110,12 @@ class TDDQNTrainer:
         self.save_interval  = Config.TD_SAVE_INTERVAL
         self.save_dir       = Config.TD_SAVE_DIR
 
-        # ── 网络 ──
-        self.q_net      = QNetwork()
-        self.target_net = QNetwork()
+        # ── 网络 (按队伍拆分) ──
+        self.q_net      = TeamQNetwork()
+        self.target_net = TeamQNetwork()
         self._sync_target()                        # 初始化时同步
 
-        self.optimizer  = optim.Adam(self.q_net.parameters(), lr=self.lr)
+        self.optimizer  = optim.Adam(self.q_net.get_all_parameters(), lr=self.lr)
         self.loss_fn    = nn.MSELoss()
         self.action_sp  = ActionSpace()
         self.rules      = RulesEngine()
@@ -121,6 +140,18 @@ class TDDQNTrainer:
             return None
         ht = self.rules.detect_hand_type(last_played_cards)
         return Hand(last_played_cards, ht) if ht != HandType.INVALID else None
+
+    def _encode_state_full(self, game: GameEngine, player_idx: int, last_played_cards: list) -> np.ndarray:
+        """编码完整状态，包含所有追踪信息"""
+        gs = game.get_game_state()
+        return encode_state(
+            game, player_idx, last_played_cards,
+            played_cards_history=game.get_played_cards_history(),
+            current_round_cards=gs.current_round_cards,
+            last_play_player=gs.last_played_player if gs.last_played_player is not None else -1,
+            pass_counts=game.get_pass_counts(),
+            step=game.get_total_step()
+        )
 
     def select_action(
         self,
@@ -156,10 +187,10 @@ class TDDQNTrainer:
             return chosen[0], chosen[1], 0.0
 
         # Exploit
-        state_vec = encode_state(game, player_idx, last_played_cards)
+        state_vec = self._encode_state_full(game, player_idx, last_played_cards)
         actions   = [c[0] for c in candidates]
         encs      = [c[1] for c in candidates]
-        best_a, best_q, _ = self.q_net.select_best(state_vec, actions, encs)
+        best_a, best_q, _ = self.q_net.select_best(state_vec, actions, encs, player_idx)
         best_enc = encode_action(best_a)
         return best_a, best_enc, best_q
 
@@ -303,7 +334,7 @@ class TDDQNTrainer:
                 continue
 
             # ── 编码当前状态 ──
-            state_vec = encode_state(game, current_idx, last_played_cards)
+            state_vec = self._encode_state_full(game, current_idx, last_played_cards)
 
             # ── 记录分数快照 (用于奖励计算) ──
             score_before   = list(game.get_game_state().team_scores)
@@ -364,7 +395,7 @@ class TDDQNTrainer:
 
             # ── 编码 next_state (从当前玩家视角) ──
             done = game.get_game_state().game_over
-            next_state_vec = encode_state(game, current_idx, last_played_cards)
+            next_state_vec = self._encode_state_full(game, current_idx, last_played_cards)
 
             # ── 获取 next_state 的合法动作编码 ──
             if done or player.is_out():
@@ -378,6 +409,7 @@ class TDDQNTrainer:
             self.replay.push(
                 state_vec, action_enc, reward,
                 next_state_vec, next_action_encs, done,
+                current_idx,  # 记录玩家索引，用于选择对应队伍的网络
             )
             sample_count += 1
 
@@ -420,16 +452,16 @@ class TDDQNTrainer:
             if s.done or len(s.next_action_encs) == 0:
                 next_max_qs[i] = 0.0
             else:
-                # Online 网络选动作
+                # Online 网络选动作 (使用对应队伍的网络)
                 best_idx = self.q_net.select_best_action_idx(
-                    s.next_state, s.next_action_encs
+                    s.next_state, s.next_action_encs, s.player_idx
                 )
                 if best_idx < 0:
                     next_max_qs[i] = 0.0
                 else:
-                    # Target 网络评估价值
+                    # Target 网络评估价值 (使用对应队伍的网络)
                     next_max_qs[i] = self.target_net.compute_q_for_action(
-                        s.next_state, s.next_action_encs[best_idx]
+                        s.next_state, s.next_action_encs[best_idx], s.player_idx
                     )
 
         next_max_qs_t = torch.FloatTensor(next_max_qs)
@@ -437,12 +469,17 @@ class TDDQNTrainer:
 
         # ── 前向 + 反向 ──
         self.q_net.train()
-        preds = self.q_net(states, actions)
+        # 按玩家索引分别计算Q值 (每个样本使用对应队伍的网络)
+        preds_list = []
+        for i, s in enumerate(batch):
+            pred = self.q_net(states[i:i+1], actions[i:i+1], s.player_idx)
+            preds_list.append(pred)
+        preds = torch.cat(preds_list)
         loss  = self.loss_fn(preds, targets)
 
         self.optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.q_net.parameters(), self.grad_clip)
+        torch.nn.utils.clip_grad_norm_(self.q_net.get_all_parameters(), self.grad_clip)
         self.optimizer.step()
 
         self.total_train_steps += 1
@@ -457,15 +494,20 @@ class TDDQNTrainer:
     # 主训练循环
     # ──────────────────────────────────────────
     def train(self, num_episodes: int = 10_000):
-        win_hist  = deque(maxlen=200)
-        loss_hist = deque(maxlen=200)
+        win_hist     = deque(maxlen=200)
+        loss_hist    = deque(maxlen=200)
+        steps_hist   = deque(maxlen=200)
+        samples_hist = deque(maxlen=200)
 
-        print("=" * 60)
+        print("=" * 70)
         print("TD Q-Learning + Target Network + Double DQN 自博弈训练")
+        print("  [队伍网络版] Team 0 (玩家0,2) 和 Team 1 (玩家1,3) 各自独立网络")
         print(f"  网络维度: STATE={STATE_DIM}, ACTION={ACTION_DIM}")
-        print(f"  总局数: {num_episodes}, Batch={self.batch_size}")
-        print(f"  gamma={self.gamma}, target_sync={self.target_sync}")
-        print("=" * 60)
+        print(f"  总局数: {num_episodes}, Batch={self.batch_size}, 每局训练{self.train_per_ep}次")
+        print(f"  Gamma={self.gamma}, TargetSync={self.target_sync}, GradClip={self.grad_clip}")
+        print("=" * 70)
+        start_time = time.time()
+        last_print_time = start_time
 
         for ep in range(1, num_episodes + 1):
             # ── 对局 (逐步收集 TD 样本) ──
@@ -480,34 +522,49 @@ class TDDQNTrainer:
 
             # ── 统计 ──
             win_hist.append(1 if info['team1_win'] else 0)
+            steps_hist.append(info['steps'])
+            samples_hist.append(info['samples'])
             if ep_losses:
                 loss_hist.append(np.mean(ep_losses))
 
             # ── Epsilon 衰减 ──
             self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
 
-            # ── 打印进度 ──
-            if ep % 100 == 0:
-                win_rate = np.mean(win_hist)
-                avg_loss = np.mean(loss_hist) if loss_hist else float('nan')
-                buf_size = len(self.replay)
-                print(
-                    f"[Ep {ep:>6}/{num_episodes}] "
-                    f"Win={win_rate:.1%}  Loss={avg_loss:.4f}  "
-                    f"ε={self.epsilon:.3f}  Buffer={buf_size:>6}  "
-                    f"TrainSteps={self.total_train_steps}"
-                )
+            # ── 实时进度条 ──
+            win_rate = np.mean(win_hist) if win_hist else 0.0
+            avg_steps = np.mean(steps_hist) if steps_hist else 0.0
+            avg_loss = np.mean(loss_hist) if loss_hist else 0.0
+            buf_size = len(self.replay)
+            
+            # 每1局都打印简要信息
+            team_scores = info['team_scores']
+            elapsed = time.time() - start_time
+            eps_per_sec = ep / elapsed if elapsed > 0 else 0
+            print(f"[Ep {ep:>6}/{num_episodes}] Win={win_rate:.1%} Loss={avg_loss:.4f} ε={self.epsilon:.3f} | "
+                  f"Steps={info['steps']:.0f} Score=[{team_scores[0]:>3}:{team_scores[1]:>3}] | "
+                  f"Buffer={buf_size:>6} | {eps_per_sec:.1f}eps/s")
 
             # ── 保存检查点 ──
             if ep % self.save_interval == 0:
                 path = os.path.join(self.save_dir, f"q_net_ep{ep}.pth")
                 self.q_net.save(path)
-                print(f"  [Save] {path}")
+                print(f"\n  [Save] 检查点已保存: {path}")
+
+        # ── 最终统计 ──
+        print("\n" + "=" * 70)
+        final_win_rate = np.mean(win_hist) if win_hist else 0.0
+        final_loss = np.mean(loss_hist) if loss_hist else 0.0
+        total_time = time.time() - start_time
+        print(f"[Done] 训练完成!")
+        print(f"       总局数: {num_episodes} | 总时间: {total_time/60:.1f}分钟 | 速度: {num_episodes/total_time:.1f}局/秒")
+        print(f"       最终胜率: {final_win_rate:.1%} | 最终Loss: {final_loss:.4f}")
+        print(f"       总训练步数: {self.total_train_steps} | 经验缓冲区: {len(self.replay)}")
 
         # ── 最终保存 ──
         final_path = os.path.join(self.save_dir, "q_net_final.pth")
         self.q_net.save(final_path)
-        print(f"\n[Done] 训练完成, 模型保存至: {final_path}")
+        print(f"[Save] 模型保存至: {final_path}")
+        print("=" * 70)
 
     def load(self, path: str):
         self.q_net.load(path)
