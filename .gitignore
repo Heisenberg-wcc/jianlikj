@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# 模型权重（大文件，不提交）
+*.pth
+*.pt
+*.ckpt
+ppo_models/
+ppo_models_engineering/
+simulator/ppo_models/
+simulator/ppo_models_engineering/
+simulator/q_models/
+
+# IDE / 工具
+.qoder/
+.workbuddy/
+.vscode/
+.idea/
+
+# 环境
+.env
+venv/
+env/
